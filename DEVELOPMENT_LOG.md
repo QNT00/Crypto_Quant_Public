@@ -12,411 +12,416 @@
 
 ---
 
-## 2026-04-25: 페이퍼 트레이더 사일런트 행 사고 후속 조치 — 데이터 신선도 가드, 하트비트 파일, Telegram 알림, Healthcheck 교정
-## 2026-04-25: Paper Trader Silent Hang Postmortem Actions — Data Freshness Guard, Heartbeat File, Telegram Notifier, Healthcheck Correction
+## 2026-04-25 ~ 2026-04-26: BTC ML 재시도 — 방법론 파이프라인 연결 완료
+## 2026-04-25 ~ 2026-04-26: BTC ML Retry — Methodology Pipeline Wiring Complete
 
 ### 배경 (Background)
 
 KO:
-4월 19일부터 가동 중이던 SOL 페이퍼 포워드 테스트가 4월 21일 마지막 트레이드 이후 약 3일간 신호 0건 상태로 정지. 24일 점검 시 컨테이너는 살아있고 5분 주기 하트비트 로그도 정상 출력되었으나, 거래소로의 TCP 연결이 0개, 시그널·트레이드 파일은 갱신되지 않은 상태. Healthcheck가 "unhealthy" 였음에도 자동 재시작이 트리거되지 않아 사고가 장기화됨.
+4월 23~24일 설계·구현을 완료하고 동결해 두었던 BTC 재시도 파이프라인의 연결 작업을 재개. 면밀한 재점검을 거쳐 추가 결함 두 가지를 발견·수정하고, 전체 파이프라인의 end-to-end 통합 검증까지 완료. 이로써 실험 착수의 모든 전제 조건이 충족됨.
 
 EN:
-The SOL paper forward test running since April 19 stopped producing signals after the final trade on April 21 — three days of total silence. On April 24 inspection, the container was alive and the 5-minute heartbeat log was firing normally, yet there were zero outbound TCP connections to the exchange and the signal/trade files had not advanced. Despite the healthcheck reading "unhealthy" the entire time, the restart policy never triggered and the outage stretched on.
+Resumed the wiring work on the BTC retry pipeline that had been frozen after the April 23–24 design and implementation pass. A careful re-inspection surfaced two additional defects; both were resolved, and end-to-end integration verification of the full pipeline was completed. All preconditions for starting the experiment are now met.
 
 ---
 
-### 문제 1: 데이터 파이프라인의 사일런트 실패 (Problem 1: Silent Data Pipeline Failure)
+### 문제 1: 신규 모듈과 실험 실행 경로의 미연결 (Problem 1: New Modules Disconnected from the Experiment Execution Path)
 
 KO:
-**현상**: 데이터 fetch 호출은 예외를 던지지 않고 정상적으로 반환되었으나, 새로운 캔들이 들어오지 않음. 기존 코드의 재연결 로직은 "연속 N회 예외" 발생 시에만 트리거되도록 설계되어 있어, 캐시된 응답이나 빈 응답을 받는 사일런트 실패에는 반응하지 못함.
-
-**구조적 원인**:
-- 데이터 신선도(freshness)에 대한 관찰이 코드 어디에도 존재하지 않음.
-- 하트비트 로그는 데이터 흐름과 독립적인 타이머에서 찍혀, 데이터가 끊겨도 "살아 있는 것처럼" 보였음.
-- 관측 가능한 신호가 "예외" 단 하나에 의존 → 예외 없이 망가지는 모든 실패가 보이지 않음.
+모든 신규 통계 모듈이 독립 검증을 통과했으나, 실제 실험이 실행될 때 이 모듈들이 호출되지 않는 상태였음. 실험 진입점에 명시적 라우팅 없이 암묵적 기본값에 의존하는 구조가 원인. 이 상태로 실험을 진행하면 새로운 방법론이 아닌 기존 파이프라인이 실행되면서 그 결과를 v3 결과로 오인하게 됨.
 
 EN:
-**Symptom**: The data fetch call kept returning successfully without raising, yet new candles never arrived. The existing reconnect logic was gated on "N consecutive exceptions" — it had no path for the silent failure mode where the call succeeds but the data is empty or cached.
-
-**Structural cause**:
-- No observation of data freshness existed anywhere in the loop.
-- Heartbeat logs ran on a timer independent of data flow, so "alive process" and "live data" were conflated.
-- Observability rested on a single signal — exceptions. Any failure that did not raise was invisible.
+All new statistical modules had passed individual verification, yet when the experiment would run, none of them were actually invoked. The cause was a structure that relied on implicit defaults at the entry point rather than explicit routing. Running the experiment in that state would execute the old pipeline and produce results that could be mistaken for v3 results.
 
 ---
 
-### 문제 2: Healthcheck가 잘못된 파일을 감시 (Problem 2: Healthcheck Watching the Wrong File)
+### 문제 2: 라벨링과 실행의 변동성 척도 불일치 (Problem 2: Labeling and Execution Using Different Volatility Measures)
 
 KO:
-**현상**: docker-compose healthcheck가 `state/portfolio.db` 의 mtime 을 600초 기준으로 검사. SQLite WAL 모드에서 본체 파일은 체크포인트 시에만 갱신되므로 며칠 동안 mtime 이 멈추는 것이 정상. 결과적으로 healthcheck 는 거래 발생/체크포인트 여부를 보고 있었을 뿐, 메인 루프 가동 여부와 무관했음.
+Triple-Barrier 라벨링과 실거래 손절 로직이 각각 서로 다른 변동성 척도를 사용하고 있었음. 라벨링은 수익률의 롤링 표준편차 기반, 실행은 ATR(Average True Range) 기반. v3 의 핵심 원칙 — "라벨링 손절과 실행 손절의 정의를 일치시킨다" — 이 이 불일치로 인해 지켜지지 않고 있었음.
 
 EN:
-**Symptom**: The docker-compose healthcheck inspected `state/portfolio.db` mtime against a 600s threshold. Under SQLite WAL mode the main DB file only updates on checkpoints, so a multi-day stale mtime is normal. The healthcheck was effectively probing "did a trade or checkpoint happen recently" — entirely unrelated to whether the event loop was running.
+The Triple-Barrier labeling and the live-execution stop-loss were each using a different volatility measure — labeling used rolling standard deviation of returns while execution used the Average True Range (ATR). The v3 core principle — "align the labeling stop-loss definition with the execution stop-loss definition" — was violated by this mismatch.
 
 ---
 
 ### 해결 방법 (Solution)
 
 KO:
-**1. 데이터 신선도 가드 (`main.py`)**:
-- `last_new_bar_wall` 단조 시계로 "마지막으로 *새로운* 캔들을 본 시점" 추적. 단순 fetch 성공이 아니라 캔들 타임스탬프 진전 여부를 기준.
-- 임계값(`stale_threshold_seconds`) 초과 시 `DATA_STALE` 이벤트 발행 + 데이터 소스 강제 재연결 시도. 복구 성공 시 `DATA_RECONNECTED` 발행.
-- 기존 "연속 예외" 트리거는 유지하되, 사일런트 실패까지 커버하는 두 번째 트리거를 병렬 추가.
+**1. 실험 진입점에 명시적 라우팅 적용**:
+- 설정에서 라벨링 방식을 단일 진실 원천(single source of truth) 으로 두고, 실험 시작 시 해당 값을 읽어 어느 파이프라인으로 진입할지를 명시적으로 결정. 예상 외의 값이 들어오면 즉시 오류로 중단. 암묵적 폴백 없음.
+- 신규 파이프라인과 레거시 파이프라인은 코드 공유 없이 완전 분리하여, 한쪽 수정이 다른 쪽에 영향을 주지 않도록 함.
 
-**2. 하트비트 파일 + Healthcheck 교정**:
-- 매 폴 사이클마다 `state/heartbeat.txt` 에 ISO 타임스탬프 + `data_age_sec` 를 atomic-rename 으로 기록.
-- docker-compose healthcheck 를 해당 파일의 mtime 검사로 교체 (임계값 = 폴 주기의 3배 + 마진). 메인 루프가 진짜로 멈추면 healthcheck 가 실패 → `restart: always` 가 컨테이너를 재기동.
-- 하트비트 로그 자체에도 `last_data_age` 필드 추가 → 사람 눈으로 즉시 데이터 흐름 상태 식별.
+**2. 라벨링 변동성 척도를 실행 방식에 맞춤**:
+- Triple-Barrier 라벨링의 장벽 계산에 사용하는 변동성 척도를 ATR 기반으로 전환. 실행 손절 계산과 완전히 동일한 공식을 사용하도록 정렬. 학습 단계와 실행 단계가 이제 같은 정의 위에서 "같은 게임" 을 평가함.
 
-**3. Telegram 알림 도입 (`core/notifier.py`)**:
-- Notifier 추상 클래스 + TelegramNotifier (rate-limited, retry, swallow-all-errors) + NullNotifier 폴백.
-- EventBus 에 새 이벤트(`SYSTEM_STARTED`, `DATA_STALE`, `DATA_RECONNECTED`) 추가. 시작/종료/포지션 진입·청산/데이터 stale·복구/전략 에러를 Telegram 으로 송출.
-- 메시지에 `[paper]` / `[live]` 모드 태그 자동 부착. 동일 플러그인이 실거래 모드에서 그대로 동작하므로, 실거래 전환 시 코드 변경 불필요.
-- 알림 송출 자체가 거래 흐름을 차단하지 않도록 모든 예외를 내부에서 흡수.
+**3. end-to-end 통합 검증 추가**:
+- 전체 파이프라인이 합성 데이터를 통과할 때 오류 없이 완료되고, 결과물이 정해진 스키마를 준수하는지 검증하는 통합 검증 항목 추가. 기존 레거시 경로도 동일 조건에서 회귀 검증.
 
-**4. 운영 문서 (`DEPLOY_RECOVERY.md`)**:
-- 서버에서 실행할 백업 → pull → 환경변수 → 재시작 → 검증 단계를 체크리스트화.
-- 검증 단계마다 "기대 출력"을 명시해 사람이 결과를 판정 가능하도록 함.
+**4. 결과물 불변성 보장**:
+- 실험 결과를 파일 시스템 write-once 모드로 기록. 같은 실험을 재실행해도 기존 결과를 덮어쓸 수 없도록 하여 사후 조작 유혹을 구조적으로 차단.
 
 EN:
-**1. Data freshness guard (`main.py`)**:
-- A monotonic `last_new_bar_wall` clock tracks "wall time of the most recent *new* bar" — advancement of bar timestamps, not just successful fetches.
-- When the gap exceeds `stale_threshold_seconds`, publish a `DATA_STALE` event and force a data-source reconnect; on success, publish `DATA_RECONNECTED`.
-- Original "consecutive-exception" trigger retained; the new freshness trigger runs alongside to also catch silent failures.
+**1. Explicit routing at the experiment entry point**:
+- The labeling method in configuration serves as the single source of truth. At experiment start, its value is read and the pipeline is routed explicitly; an unexpected value causes an immediate abort. No implicit fallbacks.
+- The new pipeline and the legacy pipeline share no code, ensuring that a change in one cannot silently affect the other.
 
-**2. Heartbeat file + healthcheck correction**:
-- Each poll cycle atomic-rewrites `state/heartbeat.txt` with an ISO timestamp + `data_age_sec`.
-- docker-compose healthcheck switched to inspect that file's mtime (threshold = 3× poll interval + margin). When the loop genuinely stalls, healthcheck fails and `restart: always` recycles the container.
-- Heartbeat log line itself now carries `last_data_age` — human eyes can spot a stalled data flow at a glance.
+**2. Aligned labeling volatility measure with execution**:
+- Converted the barrier calculation in Triple-Barrier labeling to use ATR as the volatility measure — identical to the formula used in the live-execution stop-loss. Training and execution now evaluate the same game under the same definition.
 
-**3. Telegram notifier (`core/notifier.py`)**:
-- Notifier abstract base + TelegramNotifier (rate-limited, retried, swallows all errors) + NullNotifier fallback.
-- EventBus gained `SYSTEM_STARTED`, `DATA_STALE`, `DATA_RECONNECTED`. Startup, shutdown, position open/close, data stale/reconnect, and strategy-error events route to Telegram.
-- Messages auto-tag `[paper]` / `[live]` from runtime mode. The same plugin works under live trading without code changes.
-- Notification delivery is fenced from the trading loop — every exception is logged and swallowed.
+**3. End-to-end integration verification**:
+- Added integration verification that confirms the full pipeline completes without error on synthetic data and that results conform to the expected schema. Legacy path regression is verified under the same conditions.
 
-**4. Operations doc (`DEPLOY_RECOVERY.md`)**:
-- A server-side checklist: backup → pull → env → restart → verify. Each verify step states the expected output so a human can decide pass/fail.
+**4. Guaranteed result immutability**:
+- Experiment results are written in write-once mode. Re-running the same experiment cannot overwrite existing results, structurally closing the temptation of post-hoc modification.
 
 ---
 
 ### 결과 및 배운 점 (Result & Learnings)
 
 KO:
-1. **"살아있다"의 정의는 다층적**: 프로세스가 죽지 않은 것, 메인 루프가 도는 것, 데이터가 흐르는 것은 모두 다른 사건. Healthcheck 와 알림은 가장 외곽층(데이터 흐름)을 보아야 의미가 있음. 안쪽 층(프로세스 생존)만 보면 "살아있는데 일을 안 하는" 상태가 안 잡힘.
+1. **단일 진실 원천의 중요성**: 파이프라인 분기를 결정하는 기준이 여러 곳에 흩어져 있으면 어느 한 곳을 빠뜨리는 실수가 반드시 발생한다. 하나의 진입점에서 하나의 값으로 결정되는 구조가 인간 오류에 가장 강하다.
 
-2. **예외 기반 관측의 한계**: 분산 시스템의 절반 이상의 실패는 예외를 던지지 않는다. 신선도(freshness)나 진전(progress) 같은 양의 지표를 별도 채널로 가져야 함.
+2. **방법론 일치는 선언으로 완성되지 않는다**: "라벨링과 실행을 맞춘다" 는 원칙을 문서에 적어 두었더라도, 실제 코드가 다른 척도를 사용하고 있으면 원칙은 공허하다. 설계 의도와 구현 결과를 별도로 검증해야 하는 이유.
 
-3. **WAL 파일 주의**: SQLite WAL 모드에서 본체 DB 파일의 mtime 은 거의 의미 없는 신호. 라이브니스 신호로 채택할 때 매번 점검 필요.
+3. **통합 검증은 모듈 검증과 별개의 카테고리**: 모든 모듈이 독립적으로 옳더라도, 그 모듈들이 실제로 연결되어 올바른 순서로 실행되는지는 다른 질문이다. 두 종류의 검증을 명시적으로 분리해 두지 않으면 통합 검증은 누락되기 쉬움.
 
-4. **알림은 거래 흐름과 절연(isolated)되어야 함**: Telegram 송출 실패가 트레이딩을 막아서는 안 됨. 모든 외부 I/O 는 swallow-all-errors 로 감쌌고, 거래 결정은 알림 결과를 기다리지 않음.
-
-5. **재발 방지의 한계**: 본 수정으로 동일 실패 모드는 잡히지만, 다른 종류의 장애(API 스키마 변경, 디스크 가득참, EC2 장애)는 별도로 다뤄야 함. "이 문제는 안 일어남" 과 "어떤 문제도 안 일어남" 은 다른 명제.
+4. **결과 불변성은 과적합 방지 인프라의 일부**: 실험 결과를 덮어쓸 수 있는 구조는 "결과를 보고 파라미터를 조정한 뒤 다시 실행하는" 행동을 기술적으로 허용한다. write-once 는 단순한 파일 관리 관행이 아니라 과적합 방지 프로토콜의 일환.
 
 EN:
-1. **"Alive" is layered**: Process not dead, main loop turning, and data flowing are three distinct events. A healthcheck or alert is only meaningful when it inspects the outermost layer (data flow). Watching only the inner layer (process liveness) misses the "alive but doing nothing" state.
+1. **Single source of truth matters**: When the criterion for a pipeline branch is scattered across multiple locations, omitting one is inevitable. A structure where a single entry point reads a single value is the most robust against human error.
 
-2. **Exception-based observation is insufficient**: More than half of distributed-system failures don't raise. Liveness and progress signals must travel through a separate channel from error reporting.
+2. **Methodology alignment is not complete at the declaration stage**: Writing "align labeling with execution" in a plan means nothing if the implementation uses different measures. The design intent and the implementation result require separate verification.
 
-3. **Beware of WAL files**: A SQLite WAL-mode main DB file's mtime is a near-meaningless liveness signal. Any liveness probe touching a DB file must be reviewed for this.
+3. **Integration verification is a different category from module verification**: Even if every module is individually correct, whether those modules are actually connected and executed in the right order is a different question. Unless the two verification types are explicitly separated, integration verification will routinely be skipped.
 
-4. **Notifications must be isolated from trading**: A Telegram delivery failure must not block trades. All external I/O paths are wrapped in swallow-all-errors, and trade decisions never wait on notification results.
-
-5. **Limits of "won't happen again"**: This fix prevents the specific failure mode but says nothing about API schema changes, disk-full, EC2 outages, or any other class of failure. "This particular problem won't recur" and "no problem will ever recur" are different claims.
+4. **Result immutability is part of anti-overfit infrastructure**: A structure that allows experiment results to be overwritten technically permits "view results, adjust parameters, re-run" behavior. Write-once is not just file hygiene — it is part of the anti-overfit protocol.
 
 ---
 
-## 2026-04-24: 페이퍼 트레이더 정지 사건 진단 — Hung 판정 → 재해석
-## 2026-04-24: Paper Trader Stall Diagnosis — Initial Hung Verdict, Re-Interpreted
+## 2026-04-25: 페이퍼 트레이더 관찰성 재설계
+## 2026-04-25: Paper Trader Observability Redesign
 
 ### 배경 (Background)
 
 KO:
-4월 21일 마지막 트레이드 이후 페이퍼 트레이더가 신호를 멈춤. 사용자가 사고를 인지하고 점검 요청.
+4월 24일 진단을 통해 데이터 파이프라인 사일런트 실패가 근본 원인임을 확인. 단순 재시작이 아닌 관찰성(observability) 과 라이브니스(liveness) 전반을 재설계하기로 결정. "같은 방식으로 망가지지 않게" 가 아니라, "어떤 방식으로 망가지든 빠르게 감지하고 자동으로 복구하게" 가 목표.
 
 EN:
-After the last trade on April 21 the paper trader stopped producing signals. The user noticed and requested an investigation.
+April 24 diagnosis confirmed that a silent data pipeline failure was the root cause. Decided to redesign observability and liveness from scratch rather than just restarting. The goal was not "prevent it from breaking the same way" but "detect any failure mode quickly and recover automatically".
 
 ---
 
-### 문제: Hung 여부 판정의 어려움 (Problem: Diagnosing Hung vs. Idle)
+### 문제 1: 데이터 신선도에 대한 감시 부재 (Problem 1: No Monitoring of Data Freshness)
 
 KO:
-"신호가 안 나는 것"인지 "프로세스가 뻗은 것"인지 구분 불가. 외부 관찰만으로는 이벤트 루프가 도는지, 거래소 연결이 살아있는지, 모델이 단순히 임계 미만이라 침묵 중인지 결정할 수 없음. 1차 진단에서 컨텍스트 스위치 카운트가 20초 동안 변하지 않은 것을 근거로 "hung" 으로 결론지었으나, 이후 docker logs 를 확인하니 5분 주기 하트비트가 계속 찍혀 있음을 발견 — **메인 루프는 살아있고**, ctxt_switches 0 은 단지 epoll 대기의 정상 상태였음.
+데이터 조회가 예외를 던지지 않아도 새 데이터가 들어오지 않는 상황에 대한 감시가 코드 어디에도 없었음. 재연결 로직이 "연속 예외 발생" 에만 반응하도록 설계되어 있어, 예외 없이 망가지는 사일런트 실패는 영원히 보이지 않는 사각지대였음.
 
 EN:
-Could not tell from the outside whether "no signals" meant "model is silent below threshold" or "process is wedged". The first diagnosis pinned it as hung based on voluntary_ctxt_switches being constant for 20 seconds; once docker logs were inspected, the 5-minute heartbeat had been printing the entire time — **the loop was alive**, and the constant ctxt_switches reading was simply normal idle epoll behavior.
+There was no monitoring anywhere for the case where data-fetch calls return normally yet no new bars arrive. The reconnect logic was designed to fire only on "consecutive exceptions" — silent failures that return without raising were permanently in the blind spot.
+
+---
+
+### 문제 2: 라이브니스 신호가 메인 루프와 무관 (Problem 2: Liveness Signal Unrelated to the Main Loop)
+
+KO:
+컨테이너의 자동 재시작을 트리거하는 건강 검사(healthcheck) 가, 운영 특성상 수일씩 갱신되지 않는 것이 정상인 객체를 감시 대상으로 삼고 있었음. "메인 루프가 한 바퀴 돌았는가" 가 아니라 "최근에 거래·체크포인트가 있었는가" 를 보고 있던 셈. 거래가 없는 정상적인 침묵 기간에도 건강 검사가 실패 판정을 내리지 않으므로, 실제 루프 정지 시에도 자동 재시작이 작동하지 않음.
+
+EN:
+The container healthcheck that should trigger automatic restart was watching an artifact whose mtime was, by normal operation, expected to be stale for days at a time. It was monitoring "did a trade or checkpoint happen recently" rather than "did the main loop complete a cycle". During any normal quiet period the healthcheck reported healthy, so even a genuine loop stall did not trigger the restart.
 
 ---
 
 ### 해결 방법 (Solution)
 
 KO:
-**1. 진단 절차 재정립**:
-- 진단 1순위: docker logs (가장 결정적). ctxt_switches, wchan 같은 커널 신호는 보조 증거.
-- ep_poll wchan 은 hung 의 근거가 아님 — asyncio 정상 대기 상태.
-- 살아있는데 일 안 하는 케이스 vs 정말 죽은 케이스를 구분하려면 외부 관측 신호(하트비트 로그)가 필수.
+**1. 데이터 신선도 감시 추가**:
+- 데이터 타임스탬프의 진전 여부를 단조 시계로 추적. 조회 성공 여부가 아니라 "마지막으로 새 데이터가 들어온 시점" 을 신선도의 정의로 삼음.
+- 신선도가 임계를 초과하면 stale 이벤트 발행 및 데이터 소스 강제 재연결 시도. 복구 시 reconnected 이벤트 발행. 기존 예외 기반 트리거는 유지하되 신선도 트리거를 병렬로 추가.
 
-**2. 결정적 증거 확보**:
-- TCP 연결 0개 + 5일치 로그에서 fetch 관련 흔적 0건 → 데이터 파이프라인이 처음부터 관찰 불가능한 상태로 운영되어 왔음을 확인.
-- 마지막 시그널 로그 시각, signals.jsonl 파일 mtime, healthcheck 실패 이력으로 사고 시간 윈도우 특정.
+**2. 메인 루프 전용 라이브니스 산출물로 건강 검사 교체**:
+- 메인 루프의 매 사이클마다 전용 라이브니스 산출물을 atomic 하게 갱신. 이 산출물은 오직 "루프가 한 바퀴 돌았다" 만을 보장.
+- 건강 검사를 이 산출물의 갱신 주기 검사로 전환. 루프가 실제로 멈추면 건강 검사 실패 → 자동 재시작 작동.
 
-**3. 후속 조치 분리**:
-- 즉시 재시작 vs 원인 분석 후 재시작 중에서 후자 선택. "재시작하면 증거 사라짐" 원칙.
-- 동시에 "복구 전 보완책 설계" 를 진행해 다음 사이클에서 동일 사고 재발 방지.
+**3. 운영 알림 채널 도입**:
+- 알림 추상 계층을 설계하여 구체 구현과 NullNotifier 폴백을 분리. 시스템 시작/종료, 데이터 이상, 포지션 진입·청산, 전략 오류 등 운영 이벤트를 실시간으로 송출.
+- 알림 전송 실패가 거래 흐름을 차단하지 않도록 외부 I/O 의 모든 예외를 내부 흡수. 페이퍼와 실거래 모드 양쪽에서 코드 변경 없이 동작.
+
+**4. 운영 복구 절차 명문화**:
+- 인시던트 발생 시 실행할 단계별 체크리스트 작성. 각 단계에 "기대 결과" 를 명시하여 사람이 패스/페일을 즉시 판정할 수 있도록 함.
+
+EN:
+**1. Added data freshness monitoring**:
+- A monotonic clock tracks "wall time of the most recent new bar" — freshness is defined by timestamp advancement, not by call success.
+- When freshness exceeds the threshold, a stale event is published and the data source is force-reconnected; recovery emits a reconnected event. The existing exception-based trigger is preserved; the freshness trigger runs in parallel.
+
+**2. Replaced healthcheck with a main-loop-dedicated liveness artifact**:
+- Every main loop iteration atomically updates a dedicated liveness artifact. This artifact guarantees exactly one thing: "the loop completed a cycle".
+- Healthcheck now watches the freshness of that artifact. When the loop genuinely stalls, healthcheck fails and automatic restart fires.
+
+**3. Operational notification channel**:
+- Designed a Notifier abstraction layer with a concrete implementation and a NullNotifier fallback. Operational events — system start/stop, data anomalies, position open/close, strategy errors — are published in real time.
+- All notification I/O exceptions are swallowed internally so that no notification failure can block trading. Works identically under paper and live modes.
+
+**4. Documented the recovery procedure**:
+- Step-by-step incident checklist with expected output at each stage so that a human can immediately decide pass or fail.
+
+---
+
+### 결과 및 배운 점 (Result & Learnings)
+
+KO:
+1. **"살아있다" 는 다층적 명제**: 프로세스 생존, 메인 루프 동작, 데이터 흐름은 모두 다른 사건이다. 라이브니스 감시는 가장 외곽층(데이터 흐름)을 봐야 비로소 의미가 있음. 안쪽 층만 감시하면 "살아있는데 아무것도 안 하는" 상태를 영원히 놓친다.
+
+2. **예외 기반 관측의 한계**: 운영 시스템의 많은 실패는 예외를 던지지 않는다. 신선도·진전 같은 양의 지표를 예외와 독립된 별도 채널로 두어야 사각지대를 없앨 수 있음.
+
+3. **라이브니스 신호는 전용 산출물이어야 함**: "가끔 일어나는 것이 정상" 인 이벤트(거래, 체크포인트)를 라이브니스 기준으로 삼으면 안 됨. 라이브니스 산출물은 메인 루프 사이클 주기로 갱신되어야만 신뢰할 수 있음.
+
+4. **알림은 거래와 절연되어야 함**: 외부 알림 채널 장애가 거래 로직에 전파되는 순간, 알림이 시스템 취약점이 된다. 모든 외부 I/O 는 거래 흐름과 완전히 분리된 경로로 동작해야 함.
+
+EN:
+1. **"Alive" is a layered claim**: Process alive, main loop running, and data flowing are three separate events. Liveness monitoring is only meaningful when it watches the outermost layer — data flow. Watching only the inner layer misses the "alive but doing nothing" state entirely.
+
+2. **Exception-based observation has hard limits**: Many operational failures do not raise. Positive indicators like freshness and progress must travel through a channel independent from error reporting.
+
+3. **Liveness signals must be dedicated artifacts**: Events that are expected to be infrequent (trades, checkpoints) cannot serve as liveness signals. A liveness artifact must update at the cadence of the main loop to be trustworthy.
+
+4. **Notifications must be isolated from trading**: The moment an external notification failure can propagate into the trading logic, the notification path becomes a system vulnerability. All external I/O must operate on a path fully separated from the trading flow.
+
+---
+
+## 2026-04-24: 페이퍼 트레이더 신호 중단 — 원인 진단
+## 2026-04-24: Paper Trader Signal Outage — Root Cause Diagnosis
+
+### 배경 (Background)
+
+KO:
+페이퍼 포워드 테스트 가동 수일째, 마지막 거래 이후 신호가 전혀 나오지 않는 상태가 지속됨을 인지. 즉각 재시작 대신 원인을 끝까지 추적하기로 결정.
+
+EN:
+Several days into the paper forward test, noticed the system had produced no signals since the last trade. Decided to trace the root cause before restarting.
+
+---
+
+### 문제: Hung 판정에서 사일런트 실패로 가설 수정 (Problem: Revised Hypothesis from "Hung" to Silent Failure)
+
+KO:
+외부에서만 관찰했을 때 "신호가 없는 상태" 가 프로세스 정지인지, 모델이 임계 미만이라 침묵 중인지 구분이 불가능함. 초기에는 커널 수준 시스템 신호의 정체(stall) 패턴을 근거로 "프로세스 정지" 로 판단했으나, 이후 애플리케이션 로그를 확인하니 주기적 하트비트가 멈추지 않고 계속 출력되고 있었음. 메인 루프는 살아있었고, 문제는 데이터 파이프라인이 예외를 던지지 않은 채 조용히 실패한 것이었음.
+
+EN:
+From the outside, "no signals" was indistinguishable from a hung process versus a model below its threshold. The initial read was "process hung", based on a stall pattern in a kernel-level system signal. Once application logs were checked, a periodic heartbeat was still printing steadily — the main loop was alive. The problem was a silent failure in the data pipeline: returning without raising, but delivering no new data.
+
+---
+
+### 해결 방법 (Solution)
+
+KO:
+**1. 진단 우선순위 재정립**:
+- 애플리케이션 로그가 1순위. 가장 직접적이고 오해의 소지가 가장 적음. 커널 수준 신호는 보조 증거로만 활용.
+- "살아있는데 아무것도 하지 않는" 상태와 "실제로 멈춘" 상태를 구분하려면, 메인 루프와 독립된 외부 관측 신호(하트비트)가 필수.
+
+**2. 가설 즉시 수정**:
+- "프로세스 정지" 가설을 하트비트 증거 확인 즉시 "데이터 파이프라인 사일런트 실패" 로 갱신. 초기 판단이 틀렸을 때 빠르게 수정하는 것이 진단의 본질.
+
+**3. 동결 후 재시작 원칙**:
+- 재시작이 운영 상태를 덮어쓰므로 원인 분석을 먼저 완료. 외부 연결 상태와 데이터 호출 흔적 부재를 종합하여 사고 시간대 특정 후 재시작.
 
 EN:
 **1. Re-prioritised the diagnostic procedure**:
-- Top priority: docker logs (most decisive). Kernel signals like ctxt_switches and wchan are supporting evidence at best.
-- ep_poll wchan is not evidence of hang — it's the normal idle state for asyncio loops.
-- Distinguishing "alive but idle" from "actually dead" requires an external observable (heartbeat log).
+- Application logs first — most direct, fewest wrong turns. Kernel-level signals are supporting evidence only.
+- Distinguishing "alive but doing nothing" from "actually stopped" requires an external heartbeat observable that runs independently of the main loop.
 
-**2. Established decisive evidence**:
-- Zero TCP connections + zero fetch-related entries across five days of logs → the data pipeline had been operating without observability from day one.
-- Last-signal timestamp, signals.jsonl mtime, and healthcheck failure history together pinned the incident window.
+**2. Immediate hypothesis update**:
+- Revised "process hung" to "silent data pipeline failure" the moment heartbeat evidence appeared. Updating a wrong initial read quickly is what diagnosis is actually about.
 
-**3. Sequencing**:
-- Chose "diagnose first, restart later" over "restart now". Restarting destroys evidence.
-- In parallel, designed the prevention work so the next cycle would not repeat the same failure (see 2026-04-25 entry).
+**3. Freeze before restart**:
+- Restarting overwrites the live system state. Root cause analysis completed first; the incident window was pinned using connection-state and log-trace evidence before restarting.
 
 ---
 
 ### 결과 및 배운 점 (Result & Learnings)
 
 KO:
-1. **로그가 1순위**: 컨텍스트 스위치, wchan, fd 목록 같은 커널 정보는 매력적이지만 해석 위험이 큼. 애플리케이션 로그가 가장 적은 오해를 부른다.
+1. **로그가 1순위**: 낮은 수준의 시스템 신호는 그럴싸해 보이지만 해석 위험이 큼. 애플리케이션 로그가 가장 적은 오해를 부른다.
 
-2. **초기 가설을 수정할 용기**: "hung" 으로 단정한 후 하트비트 로그를 보고 "데이터 파이프라인 사일런트 실패"로 가설을 갱신했음. 진단의 핵심은 가설 검증이지 가설 방어가 아님.
+2. **가설 수정이 진단의 본질**: "정지" 로 단정했다가 하트비트를 보고 즉시 갱신했음. 진단은 가설 검증이지 가설 방어가 아님. 초기 판단이 틀렸을 때 빠르게 수정하는 능력이 진단 품질을 결정.
 
-3. **재시작 = 증거 소실**: 분산 시스템 사고에서 "일단 재시작" 의 유혹은 강하지만, 같은 사고가 재발하면 두 번째도 같은 진단으로 돌아갈 수밖에 없음. 가능한 한 동결 상태에서 증거를 모은 뒤 재시작.
+3. **재시작 = 증거 소실**: 운영 사고에서 즉각 재시작의 유혹은 강하지만, 원인 모른 채 재시작하면 같은 사고가 재발해도 두 번째에도 같은 진단을 반복하게 된다.
 
 EN:
-1. **Logs first**: Kernel-level data (ctxt switches, wchan, fd listing) is alluring but easy to misinterpret. Application logs lead to the fewest mistakes.
+1. **Logs first**: Low-level system signals look authoritative but are easy to misread. Application logs lead to the fewest wrong conclusions.
 
-2. **Update the prior**: Wrongly called it "hung" first, then revised to "silent data pipeline failure" once heartbeats were checked. Diagnosis is hypothesis-testing, not hypothesis-defending.
+2. **Hypothesis revision is diagnosis**: Called it "hung" first, then immediately updated to "silent pipeline failure" when heartbeat evidence appeared. Diagnosis is hypothesis-testing, not hypothesis-defending. The speed of correcting a wrong initial read defines diagnostic quality.
 
-3. **Restart = evidence destroyed**: The temptation to "just restart" is strong in any distributed-system incident, but if the same incident recurs you'll diagnose it the same way the second time. Freeze, gather, then restart.
+3. **Restart = evidence destroyed**: The urge to restart immediately is strong in every operational incident, but restarting without knowing the cause means the next identical incident gets diagnosed the same wrong way again.
 
 ---
 
-## 2026-04-23 ~ 2026-04-24: BTC ML Retry v3 인프라 구축 + 다중 라운드 감사
-## 2026-04-23 ~ 2026-04-24: BTC ML Retry v3 Infrastructure Build + Multi-Round Audit
+## 2026-04-23 ~ 2026-04-24: BTC ML 재시도 — 통계 방법론 설계 및 파이프라인 구축
+## 2026-04-23 ~ 2026-04-24: BTC ML Retry — Statistical Methodology Design and Pipeline Build
 
 ### 배경 (Background)
 
 KO:
-Phase 1 검증에서 SOL 만 안정성 게이트를 통과하고 BTC/ETH 는 시드 표준편차 게이트에서 탈락. BTC 직접 ML 재시도를 결정하되, 단순한 파라미터 조정이 아닌 **재현성·통계 엄밀성·관찰성** 전반을 재설계. 사용자 정의: "과적합 = 과거 성과를 낙관적으로 신뢰. 미래 성과 증거 필수."
+4월 19일 확정한 방향에 따라 새로운 통계 인프라를 설계·구현. Triple-Barrier 라벨링, Deflated Sharpe 평가, 레짐 분리, 블록 부트스트랩을 독립 모듈로 작성하고 각각 단위 검증을 완료. 그러나 면밀히 검토한 결과 두 가지 구조적 결함을 발견하여, 실험 착수를 보류하기로 결정함.
 
 EN:
-In Phase 1 only SOL passed the seed-stability gate; BTC and ETH failed on seed-stddev. Decided on a BTC retry that is not a parameter tweak but a redesign of **reproducibility, statistical rigor, and observability**. User definition: "Overfitting = optimistic trust in past performance. Future-performance evidence required."
+Following the direction confirmed on April 19, new statistical infrastructure was designed and implemented. Triple-Barrier labeling, Deflated Sharpe evaluation, regime split, and block bootstrap were each built as independent modules and individually verified. However, a careful review surfaced two structural defects, leading to the decision to defer the experiment.
 
 ---
 
-### 문제 1: 단일 라운드 감사로는 결함이 잔존 (Problem 1: Defects Survive a Single Audit Pass)
+### 문제 1: 구현된 모듈이 실험 실행 경로에 연결되지 않음 (Problem 1: Implemented Modules Not Wired into the Experiment Pipeline)
 
 KO:
-초기 v3 설계 후 1차 감사에서 다수 결함을 잡았으나, 실제 코드 작성·테스트 후 2차 감사에서 추가 결함 발견. 감사를 단발성 이벤트가 아닌 라운드 기반 과정으로 운영해야 함이 명확해짐.
+새로 작성한 핵심 모듈들은 독립 검증을 통과한 상태였으나, 실제 실험 실행 경로에서 이 모듈들이 호출되지 않음을 발견. 실험을 이 상태로 실행하면 새로운 방법론이 적용된 결과가 아닌, 기존 파이프라인의 결과를 v3 결과로 오인하게 될 위험이 있음.
 
 EN:
-After the initial v3 design, the first audit found numerous defects, but a second audit conducted post-implementation surfaced additional defects. It became clear that audits must be run as multi-round cycles, not as a one-shot event.
+The newly implemented core modules had each passed their individual verifications, yet an inspection revealed that none of them were invoked in the actual experiment execution path. Running the experiment in that state would mean misreading results produced by the old pipeline as v3 results.
 
 ---
 
-### 문제 2: 모듈은 작성되었으나 파이프라인에 연결되지 않음 (Problem 2: Modules Implemented But Not Wired)
+### 문제 2: 한 크로스에셋 피처의 독립 정보 부재 (Problem 2: A Cross-Asset Feature with No Independent Information)
 
 KO:
-3차 감사 (르네상스/Citadel/HRT/Jump 의사결정자 관점) 결과 — triple-barrier 라벨링, DSR 평가, 시드 생성기, 정권 분리, 블록 부트스트랩 모듈은 모두 작성·단위테스트 통과 상태였으나 `run_experiment.py` 와 `trainer.py` 에서 호출되지 않음을 확인. 즉 "코드는 있지만 실험은 옛날 버전을 쓰는" 고립 상태.
+크로스에셋 신호 중 하나가 데이터 수집 단계의 수식 전개 결과, 기존에 이미 포함된 BTC 시장 변수의 단순 스케일링으로 환원됨을 발견. 이름과 의도는 독립적인 정보처럼 보였으나, 수학적으로 신규 정보가 0 인 피처였음. 단위 검증으로는 절대 드러나지 않는 종류의 결함이며, 데이터 수집 로직의 수식을 손으로 따라가야 비로소 보임.
 
 EN:
-The third audit (from the perspective of top quant-firm decision-makers) revealed that triple-barrier labeling, DSR evaluation, seed generator, regime split, and block bootstrap modules were all implemented and unit-tested, but neither `run_experiment.py` nor `trainer.py` invoked them. The code existed, but experiments were still running on the old machinery — orphan modules.
-
----
-
-### 문제 3: 도메넌스 피처의 수학적 결함 (Problem 3: Mathematical Flaw in the Dominance Feature)
-
-KO:
-크로스에셋 피처 중 BTC 도메넌스 변화율을 사용 중이었으나, 데이터 수집기 구현이 `total_market_cap = btc_cap / current_dominance` 로 역산한 정적 상수에 의존. 결과적으로 `dominance` 피처가 `btc_cap` 의 단순 스케일링으로 환원되어 기존 BTC 가격 수익률과 수학적으로 동등한 신호가 됨. 신규 정보 0.
-
-EN:
-A BTC dominance feature was being added to the cross-asset set, but the data collector implementation derived `total_market_cap = btc_cap / current_dominance` (a static constant). This collapses the `dominance` feature into a scaled `btc_cap`, mathematically equivalent to existing BTC return signals. Zero new information.
+One of the cross-asset signals collapsed, through the algebra of the data collection step, into a simple rescaling of a BTC market variable already present in the feature set. Its name and intent suggested independent information, but mathematically it contributed zero new signal. The kind of defect unit verification would never surface — visible only by hand-tracing the collection logic's math.
 
 ---
 
 ### 해결 방법 (Solution)
 
 KO:
-**1. 라운드 기반 감사 프로토콜**:
-- 1차: 설계 문서 단계에서 결함 탐색.
-- 2차: 코드 작성 후 단위 테스트 결과 + 데이터 흐름 검토.
-- 3차: 외부 시각(최고 퀀트펌 의사결정자 관점) 으로 사일런트 결함 탐색.
-- 각 라운드 결과를 `research/experiments/btc_retry_log.md` 에 append-only 로 기록.
+**1. 실험 동결 원칙 적용**:
+- 모든 신규 모듈이 실험 실행 경로에 명시적으로 연결되고, 전체 파이프라인을 end-to-end 로 통과하는 통합 검증이 완료될 때까지 BTC 실험 착수를 동결. "코드가 존재하지만 호출되지 않는" 상태로 결과를 내는 것 자체가 자기-기만의 입구.
 
-**2. 결함 우선순위 분류**:
-- C(Critical, 실험 중단): 도메넌스 피처 결함, 모듈 미연결.
-- M(Major, 별도 작업으로 추적): n_trials 처리, 시드 카운트 하드코딩, 라벨링 timeout 부호.
-- m(Minor, 문서화): VIF 표준화, 캘린더 월 폴드 길이 분산.
+**2. 독립 정보 없는 피처 완전 제거**:
+- 수집 로직을 수학적으로 추적하여 신규 정보가 0 임을 확인 후 해당 피처를 파이프라인에서 완전 삭제. 정보량이 없는 피처를 남기는 것은 잡음을 추가하는 것과 같음.
 
-**3. 신규 모듈 + 테스트 추가** (수치는 코드/설정 참조):
-- triple-barrier 라벨링, DSR + 블록 부트스트랩, 정권 분리, 시드 생성기, 다중공선성 체크(상관·VIF).
-- 단위 테스트 78건 통과. 사일런트 회귀 방지를 위한 회귀 테스트 추가.
+**3. 통합 검증 추가**:
+- 모듈 격리 검증만으로는 파이프라인의 연결 여부를 확인할 수 없음. 전체 파이프라인이 신규 모듈을 실제로 통과하는지를 확인하는 통합 검증 항목을 별도 카테고리로 추가.
 
-**4. 실험 실행은 모듈 연결 후로 보류**:
-- 모듈만 작성된 상태로 실험 실행 시 v2 결과로 오인할 위험. 연결 작업이 완료될 때까지 실험 동결.
+**4. 실험 실행 경로에 명시적 라우팅 적용**:
+- 어떤 설정을 사용하더라도 실험이 어느 파이프라인으로 진입하는지 명시적으로 결정되도록 단일 라우팅 지점을 도입. 암묵적 폴백 구조를 제거하여 의도치 않게 옛 파이프라인으로 실행되는 경우를 차단.
 
 EN:
-**1. Round-based audit protocol**:
-- Round 1: defect-hunt at design-document stage.
-- Round 2: post-implementation review with unit-test results + data flow inspection.
-- Round 3: external lens (top quant-firm decision-maker perspective) to surface silent defects.
-- Append-only record of every round in `research/experiments/btc_retry_log.md`.
+**1. Experiment freeze principle**:
+- The BTC experiment is frozen until every new module is explicitly wired into the execution path and an end-to-end integration verification passes. Producing results while modules exist but go uncalled is the entry point of self-deception.
 
-**2. Defect priority taxonomy**:
-- C (Critical, halts the experiment): dominance feature flaw, modules not wired.
-- M (Major, tracked as separate work items): n_trials handling, hard-coded seed count, labeling timeout sign.
-- m (Minor, documented): VIF standardization, calendar-month fold length variance.
+**2. Remove the zero-information feature**:
+- Confirmed via mathematical tracing that the feature contributed no new signal, then deleted it from the pipeline entirely. A feature with no information is equivalent to adding noise.
 
-**3. New modules + tests** (numeric values live in code/config only):
-- triple-barrier labeling, DSR + block bootstrap, regime split, seed generator, multicollinearity check (corr + VIF).
-- 78 unit tests passing. Regression coverage added to prevent silent regressions.
+**3. Add integration verification**:
+- Module-level verification cannot confirm that a module is actually invoked in the pipeline. A separate category of integration verification — checking that the full pipeline passes through the new modules — was added.
 
-**4. Experiments deferred until modules are wired**:
-- Running experiments with the modules existing-but-disconnected risks misreading old-pipeline results as v3 results. Experiments are frozen until wiring is complete.
+**4. Explicit routing at the experiment entry point**:
+- Introduced a single routing point that explicitly determines which pipeline an experiment enters, regardless of config. Removed implicit fallback structures that could silently send a run down the old path.
 
 ---
 
 ### 결과 및 배운 점 (Result & Learnings)
 
 KO:
-1. **다중 라운드 감사가 단일 라운드보다 압도적으로 우월**: 1차 → 2차 → 3차 사이에 잡힌 결함의 종류가 매번 달랐음. 작성자와 검토자의 시야각이 다르므로, 같은 사람이 시간차를 두거나 관점을 바꿔도 새 결함이 나옴.
+1. **검증 통과 ≠ 파이프라인 동작**: 모듈 격리 검증은 "그 모듈이 스스로 옳게 동작한다" 는 것만 증명. "그 모듈이 실제 실험에서 호출된다" 는 별도의 검증이 필요하며, 두 가지를 같은 것으로 취급하면 사각지대가 생긴다.
 
-2. **"테스트가 통과했다 ≠ 파이프라인이 동작한다"**: 단위 테스트는 모듈 격리 검증일 뿐. 통합 테스트가 없으면 모듈이 호출되지 않는 사일런트 디스커넥트도 충분히 발생.
+2. **데이터 수학 추적의 필요성**: 피처를 추가할 때 이름·의도의 타당성만 보면 부족하다. 수집 단계까지의 수식 전개를 직접 따라가야 비로소 "신규 정보 0" 류의 결함이 드러남. 단위 검증이 통과한다고 데이터 정의가 맞다는 보장이 없음.
 
-3. **수학적 정합성 검증의 위치**: 피처 추가 시 데이터 수집기 구현까지 들여다봐야 함. 이름·의도가 옳다고 구현이 옳다는 보장이 없음. 도메넌스 결함은 단위 테스트로는 영원히 잡히지 않았을 것 — 데이터 수학적 정의를 따라가야 보임.
-
-4. **외부 시각의 가치**: 자기 코드를 자기 시각으로만 검토하면 같은 사각지대가 유지됨. "다른 사람" 의 입장에서 다시 봐야 새 결함이 나타남.
+3. **암묵적 폴백의 위험**: 설정 실수 하나로 옛 파이프라인이 조용히 실행될 수 있는 구조는 v3 결과를 v2 로 오인하게 만든다. 분기 지점을 명시적으로 두고, 예상 외의 입력에는 즉시 오류로 반응하도록 설계해야 함.
 
 EN:
-1. **Multi-round audits crush single-round audits**: The classes of defects caught across rounds 1, 2, and 3 were different each time. Writer and reviewer have different fields of view; even the same person catches new things across temporal or perspective shifts.
+1. **Verification pass ≠ pipeline works**: Module-level verification only proves that a module operates correctly in isolation. Whether that module is actually called during the experiment requires a separate check. Treating the two as equivalent creates a blind spot.
 
-2. **"Tests pass ≠ pipeline works"**: Unit tests verify modules in isolation. Without an integration test, an orphan module never invoked from the main pipeline can pass every unit test indefinitely.
+2. **Necessity of tracing the data math**: Checking the name and intent of a feature is not sufficient. Hand-tracing the algebra through to the collection step is what surfaces defects of the "zero new information" variety. Passing unit verification does not guarantee that the data definition is correct.
 
-3. **Where to check mathematical soundness**: When adding a feature, follow it down to the data collector. Correct intent doesn't guarantee correct implementation. The dominance defect would never have been caught by unit testing — only by tracing the math of the data definition.
-
-4. **Value of an outside lens**: Reviewing your own code from your own perspective preserves the same blind spots. Forcing a "different person's" perspective surfaces fresh defects.
+3. **Danger of implicit fallbacks**: A structure where a configuration mistake silently routes the experiment down the old pipeline can cause v3 results to be misread as v2. Routing should be explicit, and unexpected inputs should trigger an immediate error rather than a silent default.
 
 ---
 
-## 2026-04-19: Phase 2 Paper Forward Test 가동 + BTC Retry v3 Plan 확정
-## 2026-04-19: Phase 2 Paper Forward Test Launch + BTC Retry v3 Plan Finalized
+## 2026-04-19: BTC ML 재시도 방향 전환 및 페이퍼 포워드 테스트 시작
+## 2026-04-19: BTC ML Retry Direction Change and Paper Forward Test Launch
 
 ### 배경 (Background)
 
 KO:
-Phase 1 ML 리서치 완료 후 SOL 모델만 안정성 게이트 통과. AWS EC2 + Docker 로 SOL 페이퍼 포워드 테스트를 가동하여 미래 데이터 기반 검증 단계로 진입. 동시에 BTC 직접 ML 재시도를 위한 v3 plan 확정 — 핵심 패러다임은 "과거 lockbox 폐기, 페이퍼 포워드 테스트가 최종 lockbox" + "라벨링과 실행의 구조적 일치".
+이전 ML 리서치에서 단일 코인 전략의 안정성 게이트 통과 여부를 시드 분포 기준으로 검증한 결과, SOL만 통과하고 BTC는 탈락. SOL 전략은 클라우드 환경에서 페이퍼 포워드 테스트를 개시하여 미래 실시간 데이터 기반의 검증 단계로 진입. 동시에 BTC 재시도 방향을 확정 — 파라미터 조정이 아닌 방법론 전면 재설계로 접근. 핵심 명제: "과적합은 과거 성과를 낙관적으로 신뢰하는 것이며, 미래 성과 증거가 필수다."
 
 EN:
-Phase 1 ML research complete; SOL is the only model that passed the stability gate. The SOL paper forward test went live on AWS EC2 + Docker, entering the future-data validation phase. In parallel, the BTC retry v3 plan was finalized — core paradigm shift: "abandon the past-data lockbox; the paper forward test itself is the final lockbox" + "labeling and execution must be structurally aligned".
+In the prior ML research phase, only the SOL strategy cleared the stability gate defined by seed-level performance distribution; BTC did not pass. The SOL strategy was brought up as a paper forward test in a cloud environment, entering the future-data validation phase. The BTC retry direction was simultaneously confirmed — not a parameter adjustment but a full methodology redesign. Core proposition: "Overfitting is optimistic trust in past performance; future-performance evidence is non-negotiable."
 
 ---
 
-### 문제 1: 과거 데이터 Lockbox 의 구조적 한계 (Problem 1: Structural Limits of Past-Data Lockbox)
+### 문제 1: 과거 데이터 Lockbox 의 구조적 소진 (Problem 1: Past-Data Lockbox Structurally Exhausted)
 
 KO:
-Phase 1 가 이미 사용 가능한 과거 데이터의 마지막 구간을 lockbox 로 소진. 같은 구간을 BTC 재시도에 재사용하면 데이터 오염, 새로 수집하려면 6~12개월 대기. 결국 어떤 형태든 "과거를 낙관적으로 본" 결정에 의존하게 됨.
+이미 보유한 과거 데이터의 최근 구간을 검증에 소진한 상태. 같은 구간을 재사용하면 데이터 오염이 발생하고, 새로운 구간을 수집하려면 수개월의 대기가 불가피. 결국 어떤 경로를 택해도 "과거를 낙관적으로 본" 결정에 의존하게 되는 구조적 함정이 존재함.
 
 EN:
-Phase 1 had already consumed the latest available block of historical data as its lockbox. Reusing it for the BTC retry would contaminate the data; collecting fresh data means 6–12 months of waiting. Either path forces an "optimistic-about-the-past" decision somewhere in the chain.
+The most recent slice of historical data had already been consumed as a validation holdout. Reusing it would contaminate the result; collecting a fresh slice requires waiting months. Either path leads back to the same structural trap — a decision that relies on optimism about the past.
 
 ---
 
-### 문제 2: ATR 기반 Fixed-Horizon 라벨링과 SL 실행의 부정합 (Problem 2: Mismatch Between ATR Fixed-Horizon Labeling and SL Execution)
+### 문제 2: 학습 라벨과 실거래 청산의 정의 불일치 (Problem 2: Mismatch Between Training Label and Live Exit Definition)
 
 KO:
-실행 단계의 손절 로직과 학습 단계의 라벨링 정의가 서로 다른 사건을 모델링. 학습은 "고정 시간 후 수익 부호" 를 예측하지만 실거래는 "SL 터치 또는 timeout 까지의 결과" 로 마감 — 학습된 함수와 실행 결과 사이에 구조적 괴리 존재.
+학습 단계는 고정된 시간 후의 수익 부호를 예측하도록 라벨을 정의. 그러나 실거래에서는 손절 또는 목표가 도달, 시간 초과 중 먼저 일어나는 사건으로 포지션이 마감. 두 정의가 서로 다른 사건을 모델링하고 있어, 학습된 함수와 실제 거래 결과 사이에 구조적 괴리가 존재함.
 
 EN:
-The execution-side stop-loss and the training-side labeling were modeling different events. Training predicted "return sign after a fixed horizon" but live trading closed on "SL touch or timeout" — a structural gap between the learned function and the executed outcome.
+Training defined labels by the sign of return after a fixed horizon. In live trading, a position closes on whichever comes first — a stop-loss, a target, or a timeout. The two definitions model different events, creating a structural gap between the learned function and the actual trade outcome.
 
 ---
 
 ### 해결 방법 (Solution)
 
 KO:
-**1. Lockbox 정의 재구성**:
-- 과거 데이터 lockbox 폐기. 페이퍼 포워드 테스트(미래 실데이터 흐름) 자체를 최종 lockbox 로 재정의.
-- 사전 커밋: 게이트·기간·실패 시 fallback 을 plan 단계에서 명문화하여 사후 조정 유혹 차단.
+**1. Lockbox 정의 전환**:
+- 과거 데이터 lockbox 를 폐기하고, 페이퍼 포워드 테스트(미래 실시간 데이터 흐름) 자체를 최종 OOS 검증으로 재정의. 미래 데이터는 기다림을 강제함으로써 자기-기만 가능성을 구조적으로 줄임.
+- 게이트 기준, 판정 기간, 실패 시 fallback 을 실험 착수 전에 명문화하여 사후 조정 유혹을 차단.
 
-**2. 라벨링과 실행 일치 (Triple-Barrier)**:
-- Lopez de Prado 의 triple-barrier 라벨링 채택: TP / SL / vertical(timeout) 중 먼저 닿는 사건이 라벨.
-- 실행 SL 과 라벨링 SL 의 정의가 일치 → 학습된 함수가 실거래에서 그대로 평가됨.
+**2. Triple-Barrier 라벨링 채택 (Lopez de Prado)**:
+- 상단 목표가(TP), 하단 손절가(SL), 수직 시간 초과(timeout) 세 장벽 중 먼저 닿는 사건을 라벨로 정의.
+- 실거래 손절 로직과 라벨링 손절 정의가 동일한 변동성 척도를 기준으로 일치하도록 설계. 학습된 함수와 실행 결과가 같은 게임 위에 놓임.
 
-**3. 통계 엄밀성**:
-- 시드 다수화로 안정성 신뢰구간 확보.
-- FDR → DSR 로 전환 (Bailey & Lopez de Prado 2014). 다중 시도 + 비정규성 보정.
-- 자기상관 보존을 위한 블록 부트스트랩으로 정권별 신뢰구간 산출.
-
-**4. Walk-forward Rolling**:
-- Expanding → Rolling 으로 전환. 폴드별 OOS 길이 동일하게 정렬해 통계 비교 왜곡 제거.
-- Purge / embargo 가 horizon 과 lookback 에 결합되도록 동적 산출.
-
-**5. Phase 2 (SOL Paper) 가동**:
-- 6개월 + 6개월 2단계 페이퍼 검증으로 통계 유의성 점검. 단계별 sharpe / drawdown / 트레이드 수 사전 커밋.
-- 통과 시 점진적 실거래(1% → 10% → 100%) 단계 명시.
+**3. 통계 엄밀성 강화**:
+- Deflated Sharpe Ratio (DSR, Bailey & Lopez de Prado 2014) 채택. 다중 탐색 시도 수와 수익률 분포의 비정규성을 함께 보정. FDR 기반 접근 대비 금융 데이터에 더 직접적으로 대응.
+- 시드 수를 대폭 늘려 안정성 신뢰구간의 통계적 신뢰도를 확보.
+- Walk-forward 방식을 rolling 으로 전환. 폴드별 OOS 길이를 동일하게 맞춰 폴드 간 통계 비교 왜곡을 제거.
+- 자기상관을 보존하는 블록 부트스트랩으로 시장 레짐별 신뢰구간 산출.
 
 EN:
 **1. Redefining the lockbox**:
-- The past-data lockbox is abandoned. The paper forward test (real future data flow) becomes the final lockbox.
-- Precommit: gates, durations, and fallbacks are written into the plan to remove post-hoc adjustment temptation.
+- Abandoned the past-data lockbox. The paper forward test — real future data — becomes the final OOS holdout. Future data enforces waiting, structurally removing the room for self-deception.
+- Gates, judgment periods, and fallbacks are committed to writing before the experiment begins, blocking post-hoc adjustment.
 
-**2. Aligning labeling with execution (triple-barrier)**:
-- Adopted Lopez de Prado's triple-barrier labeling: the first of TP / SL / vertical(timeout) sets the label.
-- Execution SL definition and labeling SL definition match — the learned function is evaluated under the same regime it executes in.
+**2. Triple-Barrier labeling (Lopez de Prado)**:
+- Label is set by whichever arrives first among upper target (TP), lower stop-loss (SL), and vertical timeout.
+- The labeling SL and the live-execution SL share the same volatility measure, ensuring the learned function is evaluated under the same regime it executes in.
 
 **3. Statistical rigor**:
-- Many-seed runs to establish a credible stability CI.
-- FDR → DSR (Bailey & Lopez de Prado 2014). Multiple-trials + non-normality adjustment.
-- Block bootstrap (autocorrelation-preserving) for per-regime confidence intervals.
-
-**4. Walk-forward rolling**:
-- Expanding → rolling. Equal OOS length per fold removes statistical-comparison distortion.
-- Purge / embargo derived dynamically from horizon and lookback.
-
-**5. Phase 2 (SOL paper) launch**:
-- Two-stage 6-month + 6-month paper validation for statistical significance. Stage-wise Sharpe / drawdown / trade count precommitted.
-- On pass, incremental live ramp (1% → 10% → 100%) explicitly defined.
+- Adopted the Deflated Sharpe Ratio (DSR, Bailey & Lopez de Prado 2014), which adjusts jointly for the number of trials tried and for non-normality of returns — a more direct treatment than FDR for financial data.
+- Increased the seed count substantially to establish a statistically credible stability confidence interval.
+- Switched walk-forward to rolling mode, aligning OOS length across all folds to remove cross-fold comparison distortion.
+- Applied circular block bootstrap (Politis & Romano 1992) for per-regime confidence intervals, preserving autocorrelation.
 
 ---
 
 ### 결과 및 배운 점 (Result & Learnings)
 
 KO:
-1. **"Lockbox 는 미래에 있다"**: 과거 데이터로 OOS 를 재구성하려는 모든 시도는 결국 "과거를 낙관적으로 본" 결정에 닿음. 미래 데이터(페이퍼 포워드)는 자료가 충분히 쌓일 때까지 기다리기를 강제하므로 자기-기만 가능성이 본질적으로 작음.
+1. **Lockbox 는 미래에 있다**: 과거 데이터로 OOS 를 재구성하려는 모든 시도는 "과거를 낙관적으로 본" 결정을 어딘가에 포함한다. 페이퍼 포워드 테스트는 기다림 자체를 검증 프로세스의 일부로 만들어 자기-기만의 구조적 입구를 막음.
 
-2. **라벨링은 손익 정의의 일부**: 라벨링 함수와 실행 청산 조건이 다르면, 모델은 사실상 "다른 게임" 을 학습한 것. 두 정의의 일치는 알파의 정의를 일관되게 만드는 토대.
+2. **라벨링은 손익 정의의 일부**: 라벨링 함수와 실행 청산 조건이 서로 다른 사건을 정의하면, 모델은 사실상 "다른 게임" 을 학습한 것이다. 두 정의의 일치는 알파의 정의를 일관되게 유지하는 토대.
 
-3. **사전 커밋의 가치**: 게이트와 fallback 을 결과를 보기 전에 명문화하면, 사후에 "이번만 예외" 유혹이 구조적으로 차단됨. 이 사전 커밋이 없으면 paper 결과가 borderline 일 때 결정자가 흔들림.
+3. **사전 커밋의 가치**: 게이트와 fallback 을 결과를 보기 전에 명문화하면, 결과가 경계선에 걸렸을 때 "이번만 예외" 의 유혹이 구조적으로 차단된다. 이 사전 커밋이 없으면 판단자가 흔들리는 순간이 반드시 온다.
 
 EN:
-1. **"The lockbox lives in the future"**: Any attempt to manufacture OOS from past data eventually leans on an optimistic-about-the-past decision. Future data (paper forward) structurally enforces waiting until enough data exists, leaving little room for self-deception.
+1. **The lockbox lives in the future**: Any attempt to manufacture OOS from past data contains an optimistic-about-the-past decision somewhere. A paper forward test makes waiting itself part of the validation process, closing the structural entry point for self-deception.
 
-2. **Labeling is part of the P&L definition**: If the labeling function and the execution close condition disagree, the model has effectively been trained on a *different* game. Aligning the two is the foundation for a consistent alpha definition.
+2. **Labeling is part of the P&L definition**: If the labeling function and the live exit condition define different events, the model has been trained on a different game. Aligning the two is the foundation for a consistent alpha definition.
 
-3. **Value of precommit**: Precommitting gates and fallbacks before results are seen structurally blocks "just this once" exceptions later. Without the precommit, a borderline paper result will shake the decision-maker every time.
+3. **Value of precommit**: Writing down gates and fallbacks before results are seen structurally blocks the "just this once" temptation when results land near the boundary. Without the precommit, the decision-maker will waver at exactly that moment.
 
 ---
-
-## 사용된 참고 문서 (Reference Documents)
-
-KO:
-- Lopez de Prado, *Advances in Financial Machine Learning* (2018) — triple-barrier 라벨링.
-- Bailey, D. H. & Lopez de Prado, M. (2014) *The Deflated Sharpe Ratio*.
-- Politis, D. N. & Romano, J. P. (1992) *A Circular Block-Resampling Procedure*.
-
-EN:
-- Lopez de Prado, *Advances in Financial Machine Learning* (2018) — triple-barrier labeling.
-- Bailey, D. H. & Lopez de Prado, M. (2014) *The Deflated Sharpe Ratio*.
-- Politis, D. N. & Romano, J. P. (1992) *A Circular Block-Resampling Procedure*.
-
 
 ## 2026-03-06 ~ 2026-03-07: AdaptiveTradingSystem 코인 구성 재설계 및 ML/DL 파이프라인 전면 재학습, 대시보드 양 시스템 연결
 ## 2026-03-06 ~ 2026-03-07: AdaptiveTradingSystem Coin Universe Redesign & Full ML/DL Pipeline Retraining, Dashboard Connected to Both Systems
