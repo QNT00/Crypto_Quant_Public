@@ -1,161 +1,194 @@
-# Algorithmic Crypto Trading System
+# Multi-Strategy Crypto Quant Framework
 
-A live-trading cryptocurrency futures system I built around **market regime classification**, a **reinforcement learning risk agent**, and three independent strategy engines running in parallel.
+A live cryptocurrency futures system I rebuilt from the ground up as a plugin-based **multi-strategy framework** — independent per-coin ML strategies running under a unified portfolio manager, with paper and live operating as isolated containers that share the same code but behave differently.
 
 [![Python](https://img.shields.io/badge/Python-3.12-blue)](https://www.python.org/)
-[![Exchange](https://img.shields.io/badge/Exchange-Bybit-yellow)](https://www.bybit.com/)
+[![Exchange](https://img.shields.io/badge/Exchange-Binance%20USDM-yellow)](https://www.binance.com/)
 [![Status](https://img.shields.io/badge/Status-Live-brightgreen)](.)
 
 ---
 
 ## Background
 
-This project started from a failed attempt at price prediction.
-The VBO strategy itself works successfully, and I have confirmed some profit, but I want to further advance the strategy and leap into the realm of precise quantities
+This system is the result of two rounds of teardown.
 
-Before this system, I spent several months building a full ML pipeline — 72-feature extraction (including physics-inspired metrics like price velocity, acceleration, and entropy), Triple Barrier labeling from Lopez de Prado's *AFML*, LSTM + Attention trained on 7GB+ of data via memory-mapped arrays, XGBoost per-coin ensembles, and a Streamlit dashboard with real-time inference. The stack was technically complete.
+The first round retired a price-prediction pipeline — 72 features, LSTM with attention, Triple Barrier labeling. The engineering worked. The alpha didn't. Out-of-sample performance degraded to random.
 
-The problem was that it didn't work in production. In-sample accuracy looked reasonable. Out-of-sample, predictions degraded toward random. The issue wasn't the engineering — it was the framing. Predicting the 'direction' of future prices assumes the market has stable patterns that repeat. It mostly doesn't.
+The second round retired the system that came out of the first pivot: a regime classifier with three parallel strategy engines (Aggressive / Adaptive / TrendFollowing) running on Bybit. It produced cleaner architecture but the regimes themselves didn't translate into operational alpha, and the three engines never genuinely diverged in behavior.
 
-That failure led to the reframe behind this system: instead of asking "where is the price going?", ask "what state is the market in right now?" Regime classification doesn't require predicting the future. It identifies the current environment and adjusts strategy and risk accordingly.
+What I learned from both attempts:
 
-This is the system that came out of that pivot.
+1. **Architecture quality and strategy validity are independent.** A clean codebase can't rescue a weak signal.
+2. **Single-coin, single-signal alpha is fragile.** Especially on BTC at retail scale on a single venue — I tried six different angles and retired all six.
+3. **Backtest performance is upper-bounded, not predictive.** Live cumulative is the only honest metric.
+
+This framework is the answer to those lessons. It assumes alpha is hard to find, easier to validate per-coin than across coins, and that operational safety has to be designed in from the start because it isn't a property the strategy provides.
 
 ---
 
 ## How It Works
 
-Most retail bots apply a fixed strategy regardless of market conditions. This system first classifies the current market regime, then routes each trade through a strategy and risk engine calibrated for that regime.
-
 ```mermaid
 graph TD
-    A[Market Data<br/>Bybit API · 5m candles] --> B[Indicator Cache<br/>ATR · RSI · MACD · BB · EMA]
-    B --> C[Market Analyzer<br/>ML Regime Classifier]
+    EX[Exchange<br/>Binance USDM · CCXT] --> DATA[DataEvent<br/>OHLCV poll]
+    DATA --> STRAT[Strategy Plugins<br/>per-coin LightGBM models]
+    STRAT -->|Signal| PM[Portfolio Manager<br/>Virtual sub-accounts]
+    PM --> RISK[Risk Engine<br/>Pre-trade caps<br/>Portfolio breaker]
+    RISK -->|Order| ADAPT[Exchange Adapter<br/>Hedge mode native]
+    ADAPT --> EX
+    ADAPT -->|FillEvent| STRAT
 
-    C -->|Regime Label| D{Signal Generator}
-    D -->|Confidence Score| E[Risk Manager<br/>RL Agent · ATR sizing]
-
-    E -->|Position Parameters| F{Entry Filter<br/>Confidence threshold<br/>Regime adjustment<br/>Slot availability}
-
-    F -->|Approved| G[Execution Engine<br/>Bybit ccxt]
-    G --> H[Order Management<br/>Entry · SL · TP · Trailing Stop]
-    H --> I[Position Monitor<br/>Sync · Exit detection · PnL logging]
-
-    I -->|Trade result| J[RL Environment<br/>Reward feedback]
-    J -->|Updated weights| E
-
-    subgraph Strategies ["Three Strategy Engines"]
-        direction LR
-        S1[Aggressive<br/>High-freq · Futures]
-        S2[Adaptive<br/>ML-weighted · Dynamic]
-        S3[Trend Following<br/>Multi-timeframe]
+    subgraph LIVE [Live Container]
+        L1[SOL · weekend filter ON · 100% seed]
     end
 
-    C --> Strategies
-    Strategies --> D
+    subgraph PAPER [Paper Container]
+        P1[SOL · filter OFF · control group]
+        P2[ETH]
+        P3[XRP]
+        P4[ADA]
+    end
+
+    EX --> LIVE
+    EX --> PAPER
 ```
 
----
-
-## Core Components
-
-### Market Regime Classifier
-
-Classifies the current market into one of five regimes using a trained ML model (scikit-learn). Each regime has a distinct entry policy — not just a different threshold, but a different posture toward risk.
-
-| Regime | Description | Entry Policy |
-|--------|-------------|--------------|
-| `STRONG_BULL` | Clear uptrend, strong momentum | Aggressive long bias |
-| `WEAK_BULL` | Mild uptrend, mixed signals | Moderate long bias |
-| `SIDEWAYS_QUIET` | Low volatility ranging | High-confidence signals only |
-| `SIDEWAYS_CHOPPY` | High volatility, no direction | Very high threshold, reduced size |
-| `STRONG_BEAR` | Clear downtrend | Short bias |
-
-The regime label feeds into both the signal generator (entry threshold adjustment) and the risk manager (position sizing).
-
-### Signal Generator
-
-Computes a directional confidence score by aggregating weighted technical indicators. Only signals above a regime-specific threshold proceed to the risk manager.
-
-The thresholds aren't fixed values — they're additive adjustments on top of a base. This means SIDEWAYS regimes demand substantially stronger evidence before entering, while STRONG regimes allow the system to be more responsive. The exact adjustment magnitudes aren't published here, but the logic is documented in the Development Log.
-
-### Reinforcement Learning Risk Agent
-
-A custom RL agent (PyTorch, PPO) trained on historical trade outcomes dynamically adjusts position sizing parameters per trade. It learns from the live reward signal: trades that go well reinforce the parameter combination used; trades that don't penalize it.
-
-The agent doesn't make entry decisions — the signal generator does that. It controls *how* to size and structure a position once entry is approved.
-
-### Execution Engine
-
-Handles all exchange interaction via `ccxt`. The main engineering challenge here was Bybit's lack of an order modify API — every stop-loss update requires cancel + re-submit. Early versions called `cancel_all_orders()` for simplicity, which silently cancelled take-profit orders as a side effect. This was a silent failure: TP was configured and appeared to be set, but was wiped on every trailing stop update.
-
-The fix was switching to individual order ID-based cancellation. Details in the [Development Log](./DEVELOPMENT_LOG.md).
-
-### Risk Manager
-
-ATR-based position sizing with a multi-stage trailing stop. The stop tightens as a position moves into profit, locking in gains progressively rather than holding a fixed stop throughout the trade.
+Strategies emit `Signal` objects. The portfolio layer applies risk checks, sizes positions, and routes to the adapter. Strategies never touch the exchange directly. Adding a new coin means dropping a directory under `strategies/` and restarting the container — no registry, no decorator, no code change.
 
 ---
 
-## Three Strategy Engines
+## Per-Coin Validation Framework
 
-| Strategy | Approach | Design Goal |
-|----------|----------|-------------|
-| **Aggressive** | High-frequency, futures-focused | Compound small consistent wins; fast scan cycle |
-| **Adaptive** | ML-weighted indicator scoring | Regime-aware signal strength; adjusts to current conditions |
-| **Trend Following** | Multi-timeframe confirmation | Capture larger directional moves; wider stops |
+Every coin runs through the same multi-phase validation before it can be deployed. The framework is fixed; per-coin work moves through phases, and post-hoc relaxation of gates, seeds, or horizons is disallowed.
 
-The three systems are designed to be loosely uncorrelated — when Aggressive underperforms in choppy conditions, Trend Following may be capturing longer moves. Diversification at the strategy level, not just the coin level.
+| Phase | Purpose |
+|---|---|
+| **A — Data audit** | Length, balance, gap, symbol consistency |
+| **B — Feature gate** | IC filter on a fixed feature pack, multicollinearity check |
+| **C — Horizon test** | Multi-horizon walk-forward Sharpe comparison |
+| **C+ — Reproducibility guards** | Git-clean check, seed determinism, dry-run |
+| **D — Full training** | Multiple configs × multiple seeds, RF sanity baseline, DSR |
+| **E — Strict gates** | Twelve robustness gates (Sharpe, worst-fold, bootstrap, regime, cost stress, cross-correlation, etc.) |
+| **F — Lockbox single-use** | A previously untouched holdout window, one shot only, marker file enforces it |
+| **F+ — Plugin export** | Multi-seed ensemble committed to `strategies/<coin>/` |
+| **G — Paper deploy + ramp** | Thirty-day paper run before any live capital ramp |
+
+A precedent emerged during this run: **lockbox is the final gate**. Some coins fail one or two strict gates at backtest scale but pass the lockbox holdout cleanly. The pass criterion isn't being loosened after the fact — what's being formalized is *which gate has final authority*. Backtest-margin artifacts are tolerated when the operation-scale holdout is clean.
+
+---
+
+## Backtest vs Live — An Honest Asymmetry
+
+The most important thing I learned in this rebuild is that backtest Sharpe is structurally inflated for this strategy family, by roughly 2×, and the cause is mechanical, not strategy-specific.
+
+- **The backtest uses the already-completed higher-timeframe bar** at the signal time. A subtle look-ahead leaks into some features.
+- **The live system only sees the in-progress higher-timeframe bar** at the same moment. Strictly causal.
+
+The live environment is the conservative one. The first month of live operation on the lead coin held cumulative around +40% with Sharpe above seven — proving the alpha is real even though the backtest number was higher. The two statements ("backtest is inflated" and "live alpha exists") are not in conflict.
+
+The evaluation policy that came out of this: backtest Sharpe is an upper-bound estimate; the actual yardstick is the live cumulative.
+
+---
+
+## Paper / Live Isolation
+
+Paper and live run in separate Docker containers with separate state, logs, and heartbeat directories. They share strategy code but behave differently through environment-driven switches.
+
+| | Paper container | Live container |
+|---|---|---|
+| Strategies | Four coins (one in control mode) | Lead coin only |
+| Weekend filter | OFF | ON |
+| Capital allocation | Conservative share per coin | Full allocation on the live coin |
+| State / logs | Isolated host directory | Separate isolated host directory |
+| Risk breaker | Per-container | Per-container |
+| Telegram prefix | `[paper]` | `[live]` |
+
+The current paper container also functions as a live experiment. The same model signal is gated on weekends in one container and allowed through in the other. After thirty days, comparing the two cumulative distributions becomes a clean test of whether the weekend-filter decision is real or sample luck.
+
+A live-side incident cannot bleed into paper and vice versa. The first time this design earned its keep was on the launch day itself, when a paper-side incident was diagnosed and contained on its own timeline while the live launch proceeded in parallel.
+
+---
+
+## Operational Safety
+
+### Per-strategy and portfolio-level risk
+
+- Per-strategy: max daily loss, max drawdown, max position count, max leverage.
+- Per-strategy alpha-decay kill switch: pauses after a streak of consecutive losses, auto-resumes after a cooldown.
+- Portfolio-wide breaker: a joint-equity drawdown cap that auto-pauses every strategy and requires explicit confirmation to resume on the next start.
+
+### Restart-safety patterns
+
+Two restart pitfalls emerged in production and now have explicit guards:
+
+1. **"Bars since entry" was being computed from wall-clock.** After a long container outage the elapsed wall time was being treated as bars held, triggering immediate horizon-exit on the first cycle back up. Every plugin now defers horizon-driven closes until the next natural bar after restart.
+
+2. **In-memory paper positions were being misread as "exchange liquidation"** during the position-sync step after restart. The sync logic now branches on adapter type — the liquidation-inference path is skipped for the paper adapter — with a regression test pinning the pattern.
+
+### Pre-launch safety
+
+Twelve-item pre-flight checklist (authentication, permissions, IP whitelist, margin mode, hedge mode, model load, symbol match, isolation directories, etc.) and nine abort conditions defined before any live container is brought up. Each gate has explicit pass/fail criteria so a human decision isn't required mid-launch.
 
 ---
 
 ## Engineering Notes
 
-**Order management without `modify`**
-Bybit doesn't support order modification. Every stop update is cancel + resubmit. Calling `cancel_all_orders()` is the simple path — it's also wrong if you have a take-profit order you want to keep. Spent time debugging why configured TP orders weren't filling before tracing it back to this. Now use ID-based individual cancellation everywhere. Full writeup in [Development Log](./DEVELOPMENT_LOG.md).
+**Hedge mode is account-level and irreversible.** Every order carries an explicit position side. The adapter idempotently enforces hedge mode and isolated margin on connect; the live launch is gated on both flags being correct.
 
-**Regime-conditional entry thresholds**
-A fixed confidence threshold treats all market regimes equally. Sideways markets generate signals at the same raw confidence levels as trending markets — but those signals are far less reliable. The solution was additive per-regime adjustments that demand progressively stronger evidence in noisier environments.
+**Adapter is a singleton per exchange.** Multiple strategies sharing an API key share the rate-limit budget. Concurrency lives in the adapter, not in each strategy.
 
-**Confidence-sorted entry queue**
-When multiple symbols generate entry signals simultaneously and position slots are limited, candidates are sorted by confidence score. Highest confidence fills first — not whichever signal arrived first.
+**Plugin discovery by directory.** No registry, no decorator. Adding a coin is `cp -r strategies/_template strategies/new_coin`, edit a config file, restart the container. The framework auto-finds it.
 
-**Live auto-retraining**
-The system monitors rolling performance metrics and triggers a model retraining cycle automatically under certain conditions (e.g., extended drawdown). This is separate from the RL agent's online learning — it's a full retrain of the regime classifier and indicator weights.
+**Heartbeat file as the liveness signal.** Each strategy task atomically writes a heartbeat file every poll cycle. The Docker healthcheck fails when any heartbeat is older than three poll intervals — the restart policy then takes over. Watching the process is not enough; watching data flow is what matters.
 
-**Daily circuit breakers**
-Two independent safety limits: daily drawdown limit and consecutive loss limit. Both pause trading when triggered and reset at UTC midnight.
+**Notification isolated from trading.** Telegram delivery failures cannot block trades. Every external I/O is wrapped in swallow-all-errors. The trade loop never waits on the notifier.
+
+**Daily monitor on live.** A ten-line live-only daily summary (7d / 30d / 60d Sharpe, cumulative, hit rate, drawdown, weekend-filter activations, days since retrain) is sent at a fixed Korean local time, computed from the live trade log plus a read-only mount of the paper container's logs for cross-environment comparison.
+
+---
+
+## What's Running Today
+
+| Container | Strategy count | Coins | Status |
+|---|---|---|---|
+| Live | 1 | Lead coin (weekend filter ON, full seed) | Live since mid-May 2026 |
+| Paper | 4 | Lead coin (control mode) + three altcoins | Continuous paper since late April 2026 |
+
+Six BTC alpha attempts have been retired. The current effort is concentrated on alt-coin coverage through the validation framework, with one coin upgraded to live and the others continuing as paper for forward validation.
 
 ---
 
 ## Tech Stack
 
 | Layer | Technology |
-|-------|-----------|
+|---|---|
 | Language | Python 3.12 |
-| Exchange API | ccxt (Bybit Futures) |
-| ML / RL | scikit-learn (regime classifier), PyTorch (RL agent) |
+| Exchange | CCXT (Binance USDM Futures, hedge mode, isolated margin) |
+| ML | LightGBM (per-coin two-class directional ensembles) |
+| Statistics | scipy, statsmodels (bootstrap, DSR, VIF) |
 | Data | pandas, numpy, Parquet |
+| Storage | SQLite (WAL mode) with shutdown-only positions sync |
 | Notifications | Telegram Bot API |
-| Infrastructure | AWS EC2, nohup process management, cron scheduling |
+| Container | Docker, restart=always, heartbeat-based healthcheck |
+| Infrastructure | AWS EC2, two isolated containers per host |
 
 ---
 
 ## Development Log
 
-All design decisions, bugs found in production, and lessons learned are documented in [DEVELOPMENT_LOG.md](./DEVELOPMENT_LOG.md).
+All design decisions, postmortems, and lessons live in [DEVELOPMENT_LOG.md](./DEVELOPMENT_LOG.md). The log goes back through the predecessor systems too — the price-prediction pipeline and the regime classifier — so the trajectory of decisions is visible, not just the current state.
 
-The log is structured around a problem → hypothesis → solution → result → learning format. It covers both this system and the predecessor ML pipeline. The goal is to show not just what was built, but why each decision was made and what it cost to figure out.
+Each entry follows the same format: background → problem or finding → decision → result and learnings. The goal is to show what each decision cost to figure out, not just what was built.
 
 ---
 
 ## Status
 
-Live since early 2026. Clean performance data collection started after fixing the order management bug described above. Regime-stratified performance analysis is planned once sufficient clean data has accumulated.
+Live since mid-May 2026 on the lead coin. The three remaining altcoins are in continuous paper validation. The next thirty-day window will produce the first quantitative comparison of the weekend-filter decision (live with filter ON vs paper control with filter OFF), which will determine whether the filter is retained, dropped, or extended for further comparison.
 
-The Adaptive and TrendFollowing systems are in development. The architecture is shared; the signal logic and risk parameters differ.
+The BTC line is paused until a genuinely new hypothesis appears (cross-exchange basis, multi-venue informational advantage). Until then, the marginal effort is better spent on additional alt-coin coverage and on hardening live operations.
 
 ---
 
-*Strategy parameters, signal thresholds, trained model files, and indicator weights are not published in this repository.*
-*This repo contains the system architecture and documented development process.*
+*Strategy parameters, model artifacts, feature definitions, seed lists, capital ratios, and threshold values are intentionally not published in this repository.*
+*This repo documents the system architecture, the validation framework, and the decision process behind both.*
