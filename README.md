@@ -31,7 +31,7 @@ This framework is the answer to those lessons. It assumes alpha is hard to find,
 ```mermaid
 graph TD
     EX[Exchange<br/>Binance USDM · CCXT] --> DATA[DataEvent<br/>OHLCV poll]
-    DATA --> STRAT[Strategy Plugins<br/>per-coin LightGBM models]
+    DATA --> STRAT[Strategy Plugins<br/>per-coin strategically confidential]
     STRAT -->|Signal| PM[Portfolio Manager<br/>Virtual sub-accounts]
     PM --> RISK[Risk Engine<br/>Pre-trade caps<br/>Portfolio breaker]
     RISK -->|Order| ADAPT[Exchange Adapter<br/>Hedge mode native]
@@ -164,7 +164,7 @@ Six BTC alpha attempts have been retired. The current effort is concentrated on 
 |---|---|
 | Language | Python 3.12 |
 | Exchange | CCXT (Binance USDM Futures, hedge mode, isolated margin) |
-| ML | LightGBM (per-coin two-class directional ensembles) |
+| ML | strategically confidential |
 | Statistics | scipy, statsmodels (bootstrap, DSR, VIF) |
 | Data | pandas, numpy, Parquet |
 | Storage | SQLite (WAL mode) with shutdown-only positions sync |
