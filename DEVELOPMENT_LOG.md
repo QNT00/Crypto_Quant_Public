@@ -12,6 +12,108 @@
 
 ---
 
+## 2026-05-20: 라이브 진입 직후 신호 연속 거절 사고 + 운영 안전망 9종 보강, 페이퍼 잔재 정리
+## 2026-05-20: Live Repeated-Reject Incident + Nine Operational Safety Nets Added, Paper Residue Cleaned
+
+### 배경 (Background)
+
+KO:
+라이브 진입 다음 날. 새벽 시간 모니터링 중 라이브 컨테이너의 거래 신호가 연속으로 12회 발생했는데 모두 주문 단계에서 거절되고 한 건도 체결되지 않은 흔적이 로그에 남아 있었다. 모델은 정상 동작 중이었고, 거래소 연결과 인증도 살아 있었다. 무엇인가 신호와 주문 사이에서 조용히 막혀 있다는 신호.
+
+EN:
+The day after live entry. While monitoring overnight, the live container produced twelve trade signals in a row, all of them rejected at the order layer with not a single fill. The model was running normally, exchange auth was intact. Something was being silently blocked between signal and order.
+
+### 진단 (Diagnosis)
+
+KO:
+원인은 단일 코인 노출도 한도. 라이브에선 한 전략에 지갑 전부를 할당하고 레버리지를 적용하기 때문에, 자본 비중과 레버리지의 곱이 자연스럽게 단일 코인 한도를 살짝 넘었다. 페이퍼에서는 한 전략이 지갑의 일부만 차지하므로 같은 곱이 한도 안에 머물렀고, 그래서 같은 코드 베이스에서도 페이퍼만 잘 돌고 라이브만 막혀 있었던 것.
+
+표면적으로는 단순 설정 충돌이지만, 더 큰 문제가 이 사건의 본질이었다. 모델은 정상이고, 위험 레이어는 정상이고, 거래소도 정상이지만, 그 사이 어디선가 같은 신호가 5분마다 재생성되어 같은 사유로 거절되는 루프가 조용히 돌고 있었다는 점. 운영자가 알아채지 못하면 알파가 계속 손실되고 있는 상태로 며칠이 지나갈 수 있는 구조였다.
+
+EN:
+The cause was the per-coin exposure cap. In live, a single strategy is sized to the full wallet with leverage, so the product of allocation × leverage naturally edged just above the cap. In paper, the same product stays inside the cap because each strategy only holds a slice of the wallet. The same codebase ran fine in paper and silently blocked in live.
+
+Surface-level it was a configuration collision, but the deeper issue was the real lesson. The model was healthy, the risk layer was healthy, the exchange was healthy — and yet, between them, the same signal was being regenerated and rejected for the same reason every five minutes. A silent rejection loop. Without the operator noticing, alpha could quietly leak for days while the surface logs looked tranquil.
+
+### 의사결정 (Decision)
+
+KO:
+즉각 한도를 올리는 식의 일회성 fix 만으로는 같은 사건이 다른 모양으로 재발할 수 있다는 판단. 자본 비중, 레버리지, 한도는 서로 독립적인 세 변수이고, 한 변수만 손대면 다음 전략이 추가될 때 동일 충돌이 다시 발생한다.
+
+대신 운영 시스템 차원에서 "이런 부조화가 진입 단계에서 자동으로 잡히도록" 하는 안전망 한 묶음을 한 번에 추가하기로. 같은 audit 사이클에서 알려져 있던 silent failure 경로 9개를 모두 식별하고, 각각에 대한 가드를 동시에 도입.
+
+EN:
+A one-off limit bump would fix this case but leave the same family of bugs to recur in a different shape when new strategies are added. Allocation, leverage, and the cap are three independent variables; touching only one of them postpones the problem.
+
+The choice was to add — in a single audit sweep — a bundle of safety nets at the operating-system level that catch this kind of mismatch automatically at the entry boundary. The same audit identified nine known silent-failure paths in the operational layer; guards for all of them were introduced in one push.
+
+### 추가 안전망 (Safety Nets Added)
+
+KO:
+- 컨테이너 시작 시 모든 전략의 자연 노출도를 자동 점검. 라이브 모드에서 부조화 발견 시 컨테이너 진입 자체를 거절. 페이퍼 모드에서는 경고만, 진입은 허용.
+- 포지션 생성/종료 시점에 즉시 상태 저장소와 동기화. 종료 사이에 컨테이너가 비-정상 종료되더라도 "행이 남아 부활하는" 패턴 차단.
+- 마진 모드 설정 실패 시 진입 자체 차단. 실패를 캐시 처리하던 silent fallback 경로 제거.
+- 거래소 측에 운영자가 모르는 포지션 발견 시 즉시 Telegram 알림.
+- 보호 주문 일괄 취소가 실패하면 운영자에게 즉시 알림.
+- 거래소-내부 상태의 reconcile 작업을 한 시간 주기 자동 실행. 기존엔 컨테이너 시작 시점 한 번만 실행되어 운영 도중의 drift 는 잡을 수 없던 구조였음.
+- 재기동 직후 보유 포지션이 즉시 만기 종료로 강제 마감되지 않도록 모든 전략에 가드 패턴 재확인.
+- 어댑터 별 동작 차이를 일관성 있게 분기하는 패턴 정착 (5/19 사고의 후속).
+
+EN:
+- At container startup, every strategy's natural exposure is audited automatically. Under live mode, a mismatch refuses container entry. Under paper, it warns but lets the container proceed.
+- Position open/close events sync to the state store immediately. Containers that die unexpectedly between close and shutdown no longer leave an orphan row that can resurrect later.
+- Margin-mode configuration failures now block entry instead of being silently cached as success.
+- Untracked positions discovered exchange-side trigger immediate Telegram alerts.
+- Bulk protective-order cancellation failures notify the operator immediately.
+- The exchange-vs-internal reconcile pass now runs on an hourly cadence instead of only once at startup, catching drift that develops mid-operation.
+- The restart-time guard against immediate horizon exit was re-verified across every plugin.
+- Adapter-specific behavioral branches are now applied with explicit consistency (follow-on from the 5/19 incident).
+
+### 페이퍼 잔재 정리 (Paper Residue Cleaned)
+
+KO:
+9 안전망 배포 과정에서, 페이퍼 컨테이너에 약 열흘 전부터 남아 있던 잔재가 발견됐다. 5/10 시점에 진입한 가상 포지션 하나가 그 사이 어느 시점의 비-정상 컨테이너 종료를 거치며 상태 저장소에 행만 남아 있던 것. 이번 재기동에서 그 행이 다시 로드되고, 진입 후 경과한 시간이 만기를 넘긴 것으로 계산되어 첫 사이클에서 즉시 만기 종료 처리됨. 종료 처리 자체는 정상 흐름이지만, 종료가 다시 저장소의 행은 지우지 않고 메모리만 비우는 구조라 phantom 으로 재부활할 가능성이 남아 있었음.
+
+같은 phantom 의 mark-to-market 변동이, 운영 중 한때 포트폴리오 합계 equity 의 peak 을 부풀려 두었다. 그 부풀려진 peak 을 기준으로 시간이 흐르며 포트폴리오 자체의 일괄 정지 (drawdown 한계 초과) 가 트리거되고, 모든 전략이 일괄 정지 상태로 startup. 즉 phantom 하나가 두 단계 cascade — 가짜 트레이드 한 건 + 포트폴리오 일괄 정지 — 를 만들어 낸 것.
+
+처리는 세 단계:
+1. 저장소에서 phantom 행을 직접 삭제, 그동안 누적되어 있던 stale 미실현 손익 잔액을 0으로 리셋.
+2. 포트폴리오 peak 을 현재 실제 equity 로 재설정, 일괄 정지 플래그 해제.
+3. 9 안전망의 일환으로 종료 시점 즉시 동기화 패치가 적용되었으므로, 향후 같은 종류의 phantom 발생 자체를 차단.
+
+EN:
+While rolling out the nine safety nets, a residue from roughly ten days back was found inside the paper container. A virtual position opened on 5/10 had survived a non-clean container shutdown somewhere in between as a row in the state store. This restart loaded it, the elapsed wall time was treated as bars-held past horizon, and the first cycle force-closed it. The close itself behaved correctly, but the close path was deleting only the in-memory copy of the position, not the persisted row — leaving it primed to resurrect on any later restart.
+
+The same phantom's mark-to-market swings had, at one point during the prior run, inflated the joint portfolio peak. Hours later as equity drifted back down, the inflated peak triggered the portfolio-wide pause condition, and on restart every strategy started paused. One phantom had produced a two-step cascade: a fake trade plus a portfolio-wide halt.
+
+The fix was three steps:
+1. Delete the orphan row from the store directly, and zero out the stale unrealized PnL it had been carrying.
+2. Reset the persisted portfolio peak to the real current equity, and clear the halt flag.
+3. The nine-safety-net release includes immediate sync at close time, so this category of phantom can no longer form in the first place.
+
+
+### 결과 및 배운 점 (Result & Learnings)
+
+KO:
+1. **Silent reject loop 는 신호 손실의 가장 위험한 형태**: 시스템의 어떤 단일 부품도 망가지지 않았는데도, 부품 사이의 부조화로 알파가 줄줄 새는 상태가 표면 로그에서는 평온해 보일 수 있다. 운영 안정성은 부품 상태가 아니라 부품 사이 인터페이스의 정합성으로 정의해야 함.
+
+2. **사후 보강 vs 사전 audit**: 한도 값 하나만 수정하는 사후 보강은 같은 사건의 다른 모양에 무방비. 운영 시스템 차원에서 시작 시점에 자동 점검을 거는 사전 audit 만이 같은 류의 사건 패밀리를 통째로 막아 준다.
+
+3. **비-정상 종료의 잔향은 시간이 지나며 누적된다**: phantom 하나가 가짜 트레이드와 포트폴리오 일괄 정지까지 만들어 낸 사례. 단일 사고로 끝나는 사고가 있고, cascade 를 만들어 내는 사고가 있다. 후자는 "사고 직후의 데이터" 가 아니라 "사고를 거친 누적 상태" 가 운영을 멈추게 한다.
+
+4. **운영 시스템 자체가 알파의 일부**: 좋은 알파를 가지고 있어도, 안전망이 부족한 운영 시스템 위에서는 그 알파가 silent 한 사고로 누적 손실로 바뀐다. 알파 개발과 운영 안전망 강화는 같은 우선순위.
+
+EN:
+1. **Silent reject loops are the most dangerous form of alpha loss**: With no single component broken, a mismatch between two healthy components can drain alpha quietly while the surface logs look clean. Operational stability has to be defined as interface coherence between parts, not the health of any part alone.
+
+2. **Post-hoc patching vs. pre-flight audit**: Bumping a single threshold value protects against this exact case, but leaves the family of similar mismatches wide open. Only a startup-time audit at the operational-system level closes the family — not the individual instance.
+
+3. **The residue of non-clean shutdowns accumulates**: One phantom row produced both a fake trade and a portfolio-wide halt. Some incidents end with the event; others cascade. For the latter, what stops operations is not the data right after the incident, but the accumulated state that grows over the days after it.
+
+4. **The operational system is itself part of the alpha**: A good alpha riding on top of a poorly-instrumented operational layer turns into silent, compounding losses over time. Alpha development and operational safety net development belong at the same priority.
+
+---
+
 ## 2026-05-19: SOL 실전 진입 + 페이퍼/라이브 격리 운영 시작, 진입 직전 페이퍼 사고 진단
 ## 2026-05-19: SOL Live Entry + Paper/Live Isolated Operation, Pre-Entry Paper Incident Diagnosed
 
